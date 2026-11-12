@@ -62,6 +62,27 @@ RocketChip DefaultConfig（freechips.rocketchip.system，FIRRTL 1.1.0，
 - BOOM 全量回归零影响（281/285 + LFSR_2/BoomRAS/CSRFile/DecodeUnit
   check 全 PASS）。
 
+## 通用性审计与性能基线（2026-11-12）
+
+**通用性**（docs/generality_audit.md，riscv-mini 第三设计实证）：按模块名的行为特判
+为 **0**（TageTable 等命中全部是 env 门控调试钩子/注释）；第三设计 riscv-mini 零适配
+parse/emit/pyc-opt 全过（全顶层 93,596 行）；审计发现并修复 1 个真实语义 bug
+（SInt mux 扩宽 zext→sext，riscv-mini ImmGenWire 暴露）。3 处设计调参默认值已记录
+（ORPHAN_FB 无条件开、wire 排序 4000 叶上限、byte_mem 单写口）。
+
+**性能基线**（空激励周期口径，-O0，docs/perf_baseline.md）：
+
+| 设计 | 路径 | 吞吐 |
+|---|---|---|
+| BOOM trim 全顶层 | fir2pyc → pycc C++ | 15053.6 cycles/s |
+| Rocket DefaultConfig 全顶层 | fir2pyc → pycc C++（真实 byte_mem） | 3029.6 cycles/s |
+| Rocket 叶模块 | DecodeUnit / CSRFile / FetchBuffer | 84.1万 / 22.4万 / 7.85万 cycles/s |
+| Rocket 全系统 dhrystone | ESSENT C++（参照，同机同负载） | 2039 Dhrystones/s，471043 cycles |
+
+注：fir2pyc C++ 的全系统 dhrystone 需 SimDTM（extmodule 测试桥）黑盒化——当前 stub
+为常量，需 pyc.ext_module 支持（上游 PR#12 方向）。Chisel 直出 Verilog→Verilator 基线
+需 sbt/firrtl 工具链（本机未装）。
+
 ## 用法
 
 ```bash
