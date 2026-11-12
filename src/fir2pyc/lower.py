@@ -1472,7 +1472,25 @@ class ModuleLower:
                     except ValueError:
                         v = 0
                     v &= (1 << max(lf.width, 1)) - 1
-                    self.stub_ssa[lf.key()] = self._const(v, max(lf.width, 1))
+                    # emit extmodule outputs as REGISTERS (state elements
+                    # survive ALL optimization passes including eliminate-
+                    # wires and constant folding): a reg with en=0 holds its
+                    # init value forever; the C++ TB can drive the next-wire
+                    # to override it (test bridges like SimDTM); Verilator
+                    # sees a real state element and won't DCE downstream
+                    w = max(lf.width, 1)
+                    nw = self.tmp()
+                    q = self.tmp()
+                    clk = self._arg_ssa(self.pyc_clk_leaf())
+                    rst = self._arg_ssa(self.pyc_rst_leaf())
+                    init = self._const(v, w)
+                    en0 = self._const(0, 1)
+                    self.lines.append(f"  {nw} = pyc.wire : i{w}")
+                    self.lines.append(
+                        f"  pyc.assign {nw}, {init} : i{w}")
+                    self.lines.append(
+                        f"  {q} = pyc.reg {clk}, {rst}, {en0}, {nw}, {init} : i{w}")
+                    self.stub_ssa[lf.key()] = q
                 continue
             argvals = []
             for lf in ins:

@@ -86,3 +86,43 @@ g++ -std=c++20 -O2 -ftemplate-depth=4096 -I<install>/include -I/tmp/perf/CSRFile
 # golden Python
 python3 /tmp/perf/gen_driver.py --module CSRFile --golden 250
 ```
+
+## 6. 全顶层 -O3 复测（Rocket / Verilator / BOOM trim，2026-11-13）
+
+同机（Xeon Gold 6530 / 128GB）复测全顶层吞吐，**只改优化级**：源文件、driver/TB、周期结构、计时口径全部与 -O0/-O2 基线相同（空激励、steady_clock 只计主循环、串行独占；每档 N=50000/100000 各 3 次取中位）。历史 -O0/-O2 数字同日复跑核对一致（Rocket -O0 复跑 3031.0/3042.0，BOOM -O0 复跑 15063.7/15041.6）。
+
+| 设计 | 路径 | 优化级 | cycles/s @50k | cycles/s @100k | 编译 wall / 峰值 RSS | vs 旧值 |
+|---|---|---|---|---|---|---|
+| Rocket 全顶层（56MB TU） | fir2pyc → pycc C++（`rk_main.cpp`+`rk_gen.cpp`，真实 byte_mem） | -O0（基线） | 3031.0* | 3042.0* | — | — |
+| Rocket 全顶层 | 同上 | **-O3** | **52,272** | **52,166** | **2:44 / 3.79GB** | **17.2～17.3× vs 3029.6** |
+| Rocket 全顶层 | pycc Verilog → Verilator（`obj_dir`） | -Os*（名义 -O2） | 22.9M* | 24.4M* | — | — |
+| Rocket 全顶层 | 同上（新 `obj_dir_o3`） | **-O3** | 22.0M | 22.9M | verilate 5.3s + 构建<1min | ~持平（空壳模型，见下） |
+| BOOM trim 全顶层（191MB TU） | fir2pyc → pycc C++（`main_top5.cpp`+`top_gen5.cpp`） | -O0（基线） | 15063.7* | 15041.6* | 9:44 / 9.63GB | — |
+| BOOM trim 全顶层 | 同上 | **-O3** | **226,163** | **226,058** | **9:39 / 10.48GB** | **15.0× vs 15053.6** |
+
+\* 标星为 2026-11-13 同日复跑值。-O0 编译时间未留档，故只列 -O3 编译开销；BOOM -O3（9:39）与 -O0（9:44）wall 几乎相同——解析 191MB TU 占大头，优化级对编译时长影响可忽略，RSS +0.85GB。
+
+Verilator 稳定口径（避开 ms 级短跑的计时噪声，N=20M）：-O3 32.19M/31.89M cycles/s，旧 -Os 构建 32.11M cycles/s——两档等价（差异在噪声内），模型本身为空壳（下节）。
+
+### 6.1 ★Verilator 口径更正：模型是空壳，22–32M cycles/s 不是设计吞吐
+
+核对 `obj_dir`/`obj_dir_o3` 生成物发现 Verilator 模型被整体剪空：`rk_top.v` 中 TestHarness 唯一输出 `iosuccess` 直接接常量（`assign iosuccess = pyc_comb_17` ← `assign pyc_comb_17 = pyc_constant_8` ← `pyc_constant_8 = 1'd0`），Verilator 据此合法消除全部设计逻辑（636 modules / 29047 regs），生成 C++ 仅 232 行、`VTestHarness___024root___eval` 函数体为**空**。因此 -O2/-Os 与 -O3 测得的 22–32M cycles/s 均为「TB for 循环 + 空 eval」速率；此前"change-driven eval 几乎零工作"的解释不准确，实为**全设计死代码消除**。C++ 后端 `iosuccess` 同为常量（`rk_gen.cpp` TestHarness：`pyc_comb_17 = pyc_constant_8`），但 pyc C++ 每周期全树求值不受影响，3029.6（-O0）/ 52,272（-O3）是真实全设计执行数字。iosuccess 恒 0 的根因方向与 SimDTM extmodule 常量 stub（dhrystone 同一阻塞点）一致。另注：旧 `obj_dir` 的模型目标文件实际优化级为 **-Os**——verilator 默认 `OPT_FAST=-Os` 排在用户 `-CFLAGS "-O2"` 之后，GCC 后者优先；本次 -O3 构建显式 `make OPT_FAST=-O3 OPT_SLOW=-O3` 全量生效。
+
+### 6.2 复现（-O3）
+
+```bash
+INSTALL=pyCircuit-dev/.pycircuit_out/toolchain/install
+# Rocket C++ -O3（2:44 / 3.79GB）
+cd /tmp/perf && /usr/bin/time -v g++ -std=c++20 -O3 -ftemplate-depth=4096 \
+    -I$INSTALL/include rk_main.cpp -o rk_top_perf_O3 && ./rk_top_perf_O3 50000
+# Verilator -O3（空壳，见 6.1）
+cd /tmp/perf && verilator --cc rk_top.v --top-module TestHarness \
+    -I$INSTALL/include/verilog -Wno-fatal -CFLAGS "-O3" --exe rk_vtb.cpp \
+    -o rk_vperf_o3 --Mdir obj_dir_o3 \
+  && make -C obj_dir_o3 -f VTestHarness.mk -j8 OPT_FAST="-O3" OPT_SLOW="-O3" \
+  && ./obj_dir_o3/rk_vperf_o3 100000
+# BOOM trim C++ -O3（9:39 / 10.48GB）
+cd /tmp/perf && /usr/bin/time -v g++ -std=c++20 -O3 -ftemplate-depth=4096 \
+    -I$INSTALL/include -I/tmp/f2p_out main_top5.cpp -o top_perf5_O3 \
+  && ./top_perf5_O3 50000
+```

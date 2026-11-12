@@ -62,6 +62,19 @@ RocketChip DefaultConfig（freechips.rocketchip.system，FIRRTL 1.1.0，
 - BOOM 全量回归零影响（281/285 + LFSR_2/BoomRAS/CSRFile/DecodeUnit
   check 全 PASS）。
 
+## 性能对比：fir2pyc vs Chisel 直出（-O3，Rocket DefaultConfig，2026-11-13）
+
+| 路径 | cycles/s (-O3) | 口径 |
+|---|---|---|
+| **Chisel FIRRTL → Verilog → Verilator** | **119,644** | 全设计（CPU 执行 boot ROM，29k regs） |
+| **fir2pyc → pycc C++** | **52,272** | 全设计（29,047 regs 全求值，空激励） |
+| fir2pyc → pycc Verilog → Verilator | *空壳* | SimDTM extmodule 常量 stub→iosuccess 折叠→全设计 DCE；需 pyc.ext_module 黑盒 |
+| ESSENT C++（参照，-O3） | 2039 Dhrystones/s | 全系统 dhrystone（471,043 cycles） |
+
+- Chisel→Verilator 是**真实工作负载**（CPU 执行指令）；fir2pyc C++ 是空激励（每周期全树求值但无状态翻转）。前者 2.3× 于后者。
+- BOOM trim 全顶层 C++ -O3：**226,163 cycles/s**（15.0× vs -O0）。
+- 空壳根因：SimDTM 是 extmodule 测试桥（debug 口↔fesvr DTM），fir2pyc stub 为常量→消费者折叠→Verilator 全设计 DCE；C++ 后端不做 DCE（每周期全树求值），数字仍有效。修复需 pyc.ext_module 黑盒支持（上游 PR#12 方向）。
+
 ## 通用性审计与性能基线（2026-11-12）
 
 **通用性**（docs/generality_audit.md，riscv-mini 第三设计实证）：按模块名的行为特判
