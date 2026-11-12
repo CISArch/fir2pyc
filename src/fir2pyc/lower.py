@@ -2349,7 +2349,9 @@ class ModuleLower:
             a, _aw2, _ = self._extend(a, aww, aas, otw, aas)
             b, _bw2, _ = self._extend(b, bww, bbs, otw, bbs)
             ssa = self._emit_mux(sel, a, b, otw)
-            return self._extend(ssa, otw, False, w, signed)
+            # a SInt mux result must sign-extend on further widening
+            # (FIRRTL MuxPad); extending unsigned truncates high 1s
+            return self._extend(ssa, otw, ot.kind == "sint", w, signed)
         if path:
             raise LowerError(f"cannot take path {path} of primop {op} result "
                              f"(aggregate primops unsupported in v1)")
