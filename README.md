@@ -78,6 +78,11 @@ parse/emit/pyc-opt 全过（全顶层 93,596 行）；审计发现并修复 1 �
 | Rocket DefaultConfig 全顶层 | fir2pyc → pycc C++（真实 byte_mem） | 3029.6 cycles/s |
 | Rocket 叶模块 | DecodeUnit / CSRFile / FetchBuffer | 84.1万 / 22.4万 / 7.85万 cycles/s |
 | Rocket 全系统 dhrystone | ESSENT C++（参照，同机同负载） | 2039 Dhrystones/s，471043 cycles |
+| Rocket 全顶层 | fir2pyc → pycc Verilog → **Verilator** (-O2) | 23.8M–32.5M cycles/s（空激励，change-driven eval 几乎零工作；同口径 C++ 3029——差距=pyc C++ 每拍固定扫描开销 vs Verilator 全变化门控） |
+
+Verilator 路径注意：pycc VerilogEmitter 未做 Verilog 关键字保留名处理（实例名
+`reg` 非法），当前用 sed 后处理 `(\w+) reg (` → ` reg_inst (` 绕过（7 处）；
+上游应将 CppEmitter 的 isReservedCppMemberName 同款守卫加到 VerilogEmitter。
 
 注：fir2pyc C++ 的全系统 dhrystone 需 SimDTM（extmodule 测试桥）黑盒化——当前 stub
 为常量，需 pyc.ext_module 支持（上游 PR#12 方向）。Chisel 直出 Verilog→Verilator 基线
