@@ -1469,46 +1469,9 @@ class ModuleLower:
         #          will be driven later by the deferred connect pass)
         inst_names = list(self.inst_info.keys())
 
-        # Detect circular instance dependencies (A needs B's outputs,
-        # B needs A's outputs); only use two-phase when cycles exist
-        has_cycle = False
-        for n, info in self.inst_info.items():
-            if info["module"].ext:
-                continue
-            for lf in info["in"]:
-                for _c, v, _r in lf.drivers:
-                    if v is None:
-                        continue
-                    cur = v
-                    while cur is not None and cur.kind in ("subfield", "subindex", "subaccess"):
-                        cur = cur.base
-                    if cur is not None and cur.kind == "ref" \
-                            and cur.name in self.inst_info and cur.name != n:
-                        # n depends on cur.name; check reverse
-                        for lf2 in self.inst_info[cur.name]["in"]:
-                            for _c2, v2, _r2 in lf2.drivers:
-                                if v2 is None:
-                                    continue
-                                cur2 = v2
-                                while cur2 is not None and cur2.kind in ("subfield", "subindex", "subaccess"):
-                                    cur2 = cur2.base
-                                if cur2 is not None and cur2.kind == "ref" \
-                                        and cur2.name == n:
-                                    has_cycle = True
-                                    break
-                            if has_cycle:
-                                break
-                    if has_cycle:
-                        break
-                if has_cycle:
-                    break
-            if has_cycle:
-                break
-
-        if not has_cycle:
-            # No circular deps: use original single-pass emission
-            self._emit_instances_single_pass()
-            return
+        # Wire-breaking single-pass handles all cases
+        self._emit_instances_single_pass()
+        return
 
         # Phase 1: pre-allocate output SSAs
         for iname in inst_names:
@@ -1607,8 +1570,74 @@ class ModuleLower:
             emitted.add(iname)
 
 
+    def _expr_to_path(self, e) -> str | None:
+        """Convert a subfield/subindex chain expression to a path string
+        like '.io_axi4.0.aw.ready', or None if not a static ref chain."""
+        parts = []
+        cur = e
+        while cur is not None and cur.kind in ("subfield", "subindex"):
+            if cur.kind == "subfield":
+                parts.insert(0, cur.name)
+            elif cur.kind == "subindex":
+                parts.insert(0, str(cur.index))
+            cur = cur.base
+        if cur is None or cur.kind != "ref":
+            return None
+        return "." + ".".join(parts) if parts else "."
+
     def _emit_instances_single_pass(self) -> None:
-        """Original single-pass instance emission (no circular deps)."""
+        """Single-pass instance emission with wire-breaking for backward
+        references.  When instance A's input driver references instance B's
+        output and B hasn't been emitted yet (B comes later in .fir order),
+        create a pyc.wire for A's input and use the wire as the operand.
+        After all instances are emitted, assign the wire from B's output.
+        This breaks circular SSA dominance (e.g. SimAXIMem ↔ ERS)."""
+        deferred_wire_assigns = []  # [(wire_ssa, src_inst_name, src_leaf)]
+        emitted_set = set()
+
+        # Pre-scan: for each input leaf that references a not-yet-emitted
+        # instance's output, pre-create a wire and record the deferred assign
+        wire_map = {}  # (inst_name, leaf_key) -> wire_ssa
+        for iname, info in self.inst_info.items():
+            if info["module"].ext:
+                continue
+            for lf in info["in"]:
+                for _c, v, _r in lf.drivers:
+                    if v is None:
+                        continue
+                    cur = v
+                    while cur is not None and cur.kind in ("subfield", "subindex", "subaccess"):
+                        cur = cur.base
+                    if cur is not None and cur.kind == "ref" \
+                            and cur.name in self.inst_info \
+                            and cur.name != iname \
+                            and not self.inst_info[cur.name]["module"].ext:
+                        # This input references instance cur.name's output
+                        # Check if cur.name comes AFTER iname in emission order
+                        src_name = cur.name
+                        src_info = self.inst_info[src_name]
+                        # Find the source instance's output leaf
+                        src_path = None
+                        # The driver path is relative to the source instance root
+                        # Reconstruct the full path on the source
+                        # e.g., driver "mem.io_axi4.0.aw.ready" → src_path ".io_axi4.0.aw.ready"
+                        drv_path = self._expr_to_path(v)
+                        if drv_path is not None:
+                            src_path = drv_path
+                        if src_path is not None:
+                            # Find matching output leaf on source instance
+                            for src_lf in src_info["out"]:
+                                if src_lf.path == src_path and not src_lf.is_clockish:
+                                    wkey = (iname, lf.key())
+                                    if wkey not in wire_map:
+                                        w = max(src_lf.width, 1)
+                                        wssa = self.tmp()
+                                        self.lines.append(f"  {wssa} = pyc.wire : i{w}")
+                                        wire_map[wkey] = (wssa, w, src_lf.signed())
+                                        deferred_wire_assigns.append(
+                                            (wssa, src_name, src_lf, w))
+                                    break
+
         for iname, info in self.inst_info.items():
             ins, outs = info["in"], info["out"]
             if info["module"].ext:
@@ -1627,9 +1656,18 @@ class ModuleLower:
                 if lf.is_clockish:
                     argvals.append(self._clockish_value(lf))
                 else:
-                    ssa, w, sg = self._fold_driver(lf.drivers, lf, lf.path)
-                    ssa, w, _s2 = self._extend(ssa, w, sg, lf.width, lf.signed())
-                    argvals.append(ssa)
+                    # Check if this input has a wire map entry
+                    wkey = (iname, lf.key())
+                    if wkey in wire_map:
+                        # Use the pre-created wire, extended to destination width
+                        wssa, src_w, src_sg = wire_map[wkey]
+                        ext_ssa, _w, _s2 = self._extend(
+                            wssa, src_w, src_sg, lf.width, lf.signed())
+                        argvals.append(ext_ssa)
+                    else:
+                        ssa, w, sg = self._fold_driver(lf.drivers, lf, lf.path)
+                        ssa, w, _s2 = self._extend(ssa, w, sg, lf.width, lf.signed())
+                        argvals.append(ssa)
             pclk = (self._arg_ssa(self.clock_leaf) if self.clock_leaf is not None
                     else self._arg_ssa(self.pyc_clk_leaf()))
             argvals = argvals + [pclk, self.rst_arg]
@@ -1653,6 +1691,14 @@ class ModuleLower:
             else:
                 self.lines.append(
                     f"  pyc.instance {args} {callee} : ({tys_in}) -> ()")
+
+        # Deferred wire assignments: drive the pre-created wires from
+        # the providing instance's output SSAs
+        for wssa, src_name, src_lf, w in deferred_wire_assigns:
+            src_ssa = self.inst_out_ssa.get((src_lf.root, src_lf.path))
+            if src_ssa is not None:
+                self.lines.append(
+                    f"  pyc.assign {wssa}, {src_ssa} : i{w}")
 
     def _inst_dep_order(self) -> list:
         """Topological order of instance names by inst->inst output
