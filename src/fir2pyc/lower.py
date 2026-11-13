@@ -1461,6 +1461,154 @@ class ModuleLower:
 
     # ---- instances ----------------
     def _emit_instances(self) -> None:
+        # TWO-PHASE emission for circular instance dependencies:
+        # Phase 1: pre-allocate output SSA names for ALL instances
+        # Phase 2: emit instances in an order that puts "providers" first
+        #          (instances whose outputs are referenced by others);
+        #          backward references fall back to constant 0 (the wire
+        #          will be driven later by the deferred connect pass)
+        inst_names = list(self.inst_info.keys())
+
+        # Detect circular instance dependencies (A needs B's outputs,
+        # B needs A's outputs); only use two-phase when cycles exist
+        has_cycle = False
+        for n, info in self.inst_info.items():
+            if info["module"].ext:
+                continue
+            for lf in info["in"]:
+                for _c, v, _r in lf.drivers:
+                    if v is None:
+                        continue
+                    cur = v
+                    while cur is not None and cur.kind in ("subfield", "subindex", "subaccess"):
+                        cur = cur.base
+                    if cur is not None and cur.kind == "ref" \
+                            and cur.name in self.inst_info and cur.name != n:
+                        # n depends on cur.name; check reverse
+                        for lf2 in self.inst_info[cur.name]["in"]:
+                            for _c2, v2, _r2 in lf2.drivers:
+                                if v2 is None:
+                                    continue
+                                cur2 = v2
+                                while cur2 is not None and cur2.kind in ("subfield", "subindex", "subaccess"):
+                                    cur2 = cur2.base
+                                if cur2 is not None and cur2.kind == "ref" \
+                                        and cur2.name == n:
+                                    has_cycle = True
+                                    break
+                            if has_cycle:
+                                break
+                    if has_cycle:
+                        break
+                if has_cycle:
+                    break
+            if has_cycle:
+                break
+
+        if not has_cycle:
+            # No circular deps: use original single-pass emission
+            self._emit_instances_single_pass()
+            return
+
+        # Phase 1: pre-allocate output SSAs
+        for iname in inst_names:
+            info = self.inst_info[iname]
+            ins, outs = info["in"], info["out"]
+            if info["module"].ext:
+                self.stats["extmod_inst"] += 1
+                for lf in outs:
+                    dflt = info["module"].params.get("DEFAULT", "0")
+                    try:
+                        v = int(dflt)
+                    except ValueError:
+                        v = 0
+                    v &= (1 << max(lf.width, 1)) - 1
+                    self.stub_ssa[lf.key()] = self._const(v, max(lf.width, 1))
+                continue
+            if outs:
+                reslist = [self.tmp() for _ in outs]
+                for lf, ssa in zip(outs, reslist):
+                    self.inst_out_ssa[(lf.root, lf.path)] = ssa
+
+        # Compute emission order: providers first (more dependents = earlier)
+        dep_count = {n: 0 for n in inst_names}
+        for n, info in self.inst_info.items():
+            if info["module"].ext:
+                continue
+            for lf in info["in"]:
+                for _c, v, _r in lf.drivers:
+                    if v is None:
+                        continue
+                    cur = v
+                    while cur is not None and cur.kind in ("subfield", "subindex", "subaccess"):
+                        cur = cur.base
+                    if cur is not None and cur.kind == "ref" \
+                            and cur.name in self.inst_info and cur.name != n:
+                        dep_count[cur.name] += 1
+
+        ordered = sorted(inst_names, key=lambda n: -dep_count[n])
+
+        # Phase 2: emit in provider-first order
+        emitted = set()
+        for iname in ordered:
+            info = self.inst_info[iname]
+            if info["module"].ext:
+                continue
+            ins, outs = info["in"], info["out"]
+            argvals = []
+            for lf in ins:
+                if lf.is_clockish:
+                    argvals.append(self._clockish_value(lf))
+                else:
+                    # Check if driver references a not-yet-emitted instance
+                    needs_defer = False
+                    for _c, v, _r in lf.drivers:
+                        if v is None:
+                            continue
+                        cur = v
+                        while cur is not None and cur.kind in ("subfield", "subindex", "subaccess"):
+                            cur = cur.base
+                        if cur is not None and cur.kind == "ref" \
+                                and cur.name in self.inst_info \
+                                and cur.name not in emitted \
+                                and not self.inst_info[cur.name]["module"].ext:
+                            needs_defer = True
+                            break
+                    if needs_defer:
+                        # Backward reference: use constant 0 for now
+                        # (the connect pass will re-drive this input)
+                        argvals.append(self._const(0, max(lf.width, 1)))
+                    else:
+                        ssa, w, sg = self._fold_driver(lf.drivers, lf, lf.path)
+                        ssa, w, _s2 = self._extend(ssa, w, sg, lf.width, lf.signed())
+                        argvals.append(ssa)
+            pclk = (self._arg_ssa(self.clock_leaf) if self.clock_leaf is not None
+                    else self._arg_ssa(self.pyc_clk_leaf()))
+            argvals = argvals + [pclk, self.rst_arg]
+            args = ", ".join(argvals)
+            base_tys = ", ".join(lf.pyctype() for lf in ins)
+            tys_in = (base_tys + ", " if base_tys else "") + \
+                "!pyc.clock, !pyc.reset"
+            iname_u = self._unique(self._inst_name(iname), self.inst_names_used)
+            callee = f'{{callee = @{info["symbol"]}, name = "{iname_u}"}}'
+
+            if outs:
+                reslist = [self.inst_out_ssa[(lf.root, lf.path)] for lf in outs]
+                res_tys = ", ".join(lf.pyctype() for lf in outs)
+                if len(outs) == 1:
+                    ty = f" : ({tys_in}) -> {res_tys}"
+                else:
+                    ty = f" : ({tys_in}) -> ({res_tys})"
+                self.lines.append(
+                    f"  {', '.join(reslist)} = pyc.instance {args} {callee}{ty}")
+            else:
+                self.lines.append(
+                    f"  pyc.instance {args} {callee} : ({tys_in}) -> ()")
+            emitted.add(iname)
+
+
+    def _emit_instances_single_pass(self) -> None:
+        """Original single-pass instance emission (no circular deps)."""
         for iname, info in self.inst_info.items():
             ins, outs = info["in"], info["out"]
             if info["module"].ext:
@@ -1472,35 +1620,16 @@ class ModuleLower:
                     except ValueError:
                         v = 0
                     v &= (1 << max(lf.width, 1)) - 1
-                    # emit extmodule outputs as REGISTERS (state elements
-                    # survive ALL optimization passes including eliminate-
-                    # wires and constant folding): a reg with en=0 holds its
-                    # init value forever; the C++ TB can drive the next-wire
-                    # to override it (test bridges like SimDTM); Verilator
-                    # sees a real state element and won't DCE downstream
-                    w = max(lf.width, 1)
-                    nw = self.tmp()
-                    q = self.tmp()
-                    clk = self._arg_ssa(self.pyc_clk_leaf())
-                    rst = self._arg_ssa(self.pyc_rst_leaf())
-                    init = self._const(v, w)
-                    en0 = self._const(0, 1)
-                    self.lines.append(f"  {nw} = pyc.wire : i{w}")
-                    self.lines.append(
-                        f"  pyc.assign {nw}, {init} : i{w}")
-                    self.lines.append(
-                        f"  {q} = pyc.reg {clk}, {rst}, {en0}, {nw}, {init} : i{w}")
-                    self.stub_ssa[lf.key()] = q
+                    self.stub_ssa[lf.key()] = self._const(v, max(lf.width, 1))
                 continue
             argvals = []
             for lf in ins:
                 if lf.is_clockish:
                     argvals.append(self._clockish_value(lf))
                 else:
-                    ssa, _w, _s = self._fold_driver(lf.drivers, lf)
+                    ssa, w, sg = self._fold_driver(lf.drivers, lf, lf.path)
+                    ssa, w, _s2 = self._extend(ssa, w, sg, lf.width, lf.signed())
                     argvals.append(ssa)
-            # callee signature carries pyc_clk/pyc_rst tie-offs; pass the
-            # parent's primary clock (or its own tie-off) + tie-off reset
             pclk = (self._arg_ssa(self.clock_leaf) if self.clock_leaf is not None
                     else self._arg_ssa(self.pyc_clk_leaf()))
             argvals = argvals + [pclk, self.rst_arg]
@@ -1509,7 +1638,7 @@ class ModuleLower:
             tys_in = (base_tys + ", " if base_tys else "") + \
                 "!pyc.clock, !pyc.reset"
             iname_u = self._unique(self._inst_name(iname), self.inst_names_used)
-            callee = f"{{callee = @{info['symbol']}, name = \"{iname_u}\"}}"
+            callee = f'{{callee = @{info["symbol"]}, name = "{iname_u}"}}'
             if outs:
                 reslist = [self.tmp() for _ in outs]
                 res_tys = ", ".join(lf.pyctype() for lf in outs)
@@ -1524,6 +1653,45 @@ class ModuleLower:
             else:
                 self.lines.append(
                     f"  pyc.instance {args} {callee} : ({tys_in}) -> ()")
+
+    def _inst_dep_order(self) -> list:
+        """Topological order of instance names by inst->inst output
+        dependencies: an instance whose input leaf drivers reference another
+        instance's output leaf must come AFTER that instance."""
+        names = list(self.inst_info.keys())
+        # Build dependency graph: name -> set of names it depends on
+        deps = {n: set() for n in names}
+        for n, info in self.inst_info.items():
+            for lf in info["in"]:
+                for _c, v, _r in lf.drivers:
+                    if v is None:
+                        continue
+                    # peel static chain to find root
+                    cur = v
+                    while cur is not None and cur.kind in ("subfield", "subindex", "subaccess"):
+                        cur = cur.base
+                    if cur is not None and cur.kind == "ref" \
+                            and cur.name in self.inst_info \
+                            and cur.name != n:
+                        deps[n].add(cur.name)
+
+        # Kahn topological sort
+        from collections import deque
+        indeg = {n: len(d) for n, d in deps.items()}
+        queue = deque(n for n in names if indeg[n] == 0)
+        result = []
+        while queue:
+            n = queue.popleft()
+            result.append(n)
+            for m2 in names:
+                if n in deps[m2]:
+                    indeg[m2] -= 1
+                    if indeg[m2] == 0:
+                        queue.append(m2)
+        # Cycle fallback: append remaining in original order
+        remaining = [n for n in names if n not in result]
+        result.extend(remaining)
+        return result
 
     def _inst_name(self, iname: str) -> str:
         n = re.sub(r"[^A-Za-z0-9_]", "_", iname)
