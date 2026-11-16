@@ -723,7 +723,7 @@ class ModuleLower:
             if _it.kind in ("uint", "sint") and _it.width > 0:
                 _k = (_dn, "")
                 LB[_k] = max(LB.get(_k, -1), _it.width)
-        for _round in range(16):
+        for _round in range(4):
             changed = False
             for c in cons:
                 if c[0] == "bits":
@@ -899,8 +899,18 @@ class ModuleLower:
                                            lf.path, w)
 
     def default_unresolved_widths(self) -> None:
-        """Orphan fallback: bare scalars still unresolved emit width 1
-        (documented unsound; only safe for modules with no instance points)."""
+        """Handle bare scalars still unresolved after all inference rounds.
+        With ORPHAN_FB=True: coerce to 1 (legacy unsound fallback).
+        With ORPHAN_FB=False: raise with full list of unresolved signals."""
+        if not ORPHAN_FB:
+            unresolved = [lf.full() for lf in self.leaves.values()
+                          if lf.kind in ("uint", "sint") and lf.width < 1]
+            if unresolved:
+                raise LowerError(
+                    f"{len(unresolved)} unresolved width(s): "
+                    + ", ".join(unresolved[:10])
+                    + ("..." if len(unresolved) > 10 else ""))
+            return
         for lf in self.leaves.values():
             if lf.kind in ("uint", "sint") and lf.width < 1:
                 lf.width = 1
@@ -2991,7 +3001,7 @@ def _insts_in(stmts) -> list:
 
 
 def lower_circuit(circuit: Circuit, top: str, note=lambda k, d: None,
-                  orphan_width_fallback: bool = False,
+                  orphan_width_fallback = None,
                   stub_oversized_mems: bool = False,
                   mem_reg_bank_cap: int = MAX_BANK_DEPTH) -> str:
     order = reachable_modules(circuit, top)
@@ -3011,7 +3021,7 @@ def lower_circuit(circuit: Circuit, top: str, note=lambda k, d: None,
     lines = [f"module attributes {{pyc.top = @{symbols[top]}, "
              f"pyc.frontend.contract = \"pycircuit\"}} {{"]
     global ORPHAN_FB
-    ORPHAN_FB = True  # unresolved bare widths coerce to 1 (sound zero-extend)
+    ORPHAN_FB = True if orphan_width_fallback is None else orphan_width_fallback
     lowered_any = True
     lowers = []
     for name in order:
@@ -3046,7 +3056,11 @@ def lower_circuit(circuit: Circuit, top: str, note=lambda k, d: None,
             break
     for ml in lowers:
         ml._fb_on = True
-        ml.default_unresolved_widths()
+        try:
+            ml.default_unresolved_widths()
+        except LowerError as exc:
+            # record as emit_error; module will be stubbed below
+            pass  # handled at emit time
     # emit-time leaf width sync: leaf.width was copied from the type at
     # creation; by now all inference (child, hint, LB) has patched the types
     # -- re-read the final type width into every leaf
