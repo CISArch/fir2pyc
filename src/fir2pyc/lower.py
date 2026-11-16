@@ -2058,14 +2058,14 @@ class ModuleLower:
             raddr_b = self._real_mem_raddr(info, decl, st)
             bm = self._real_mem_op(info, field, raddr_b)
         except _RealMemCycle as exc:
-            if not st.get("failed"):
-                st["failed"] = True
-                self.stats["stubbed_mem"] = self.stats.get("stubbed_mem", 0) + 1
-                self.note("stubbed_mem",
-                          f"{self.mod.name}.{info['decl'].name}{field}: "
-                          f"byte_mem unsupported ({exc}); reads tied 0, "
-                          f"writes dropped")
-            return self._const(0, lw), lw, ls
+            # hard error: silently stubbing multi-write-port or cyclic
+            # memories produces wrong simulation results; the module
+            # goes through the emit_error stub path (loud failure)
+            raise LowerError(
+                f"memory {info['decl'].name}.{field} cannot use byte_mem "
+                f"({exc}); pyc.byte_mem supports 1R1W only — multi-port "
+                f"deep memories require reg-bank (depth<=cap) or explicit "
+                f"--stub-oversized-mems")
         ssa = bm
         if st["pad"] != lw:
             ssa, _tw = self._trunc(ssa, st["pad"], lw)
@@ -2088,11 +2088,10 @@ class ModuleLower:
             try:
                 self._real_mem_op(info, field, self._const(0, st["abw"]))
             except _RealMemCycle as exc:
-                st["failed"] = True
-                self.stats["stubbed_mem"] = self.stats.get("stubbed_mem", 0) + 1
-                self.note("stubbed_mem",
-                          f"{self.mod.name}.{s}{field}: byte_mem unsupported "
-                          f"({exc}); reads tied 0, writes dropped")
+                raise LowerError(
+                    f"memory {s}{field} cannot use byte_mem ({exc}); "
+                    f"multi-port deep memories are unsupported — use "
+                    f"--stub-oversized-mems to explicitly stub")
 
     # ---- return ----------------
     def _emit_return(self) -> None:

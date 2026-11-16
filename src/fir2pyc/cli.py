@@ -67,14 +67,14 @@ def cmd_emit(args: argparse.Namespace) -> int:
         circuit = parse_fir_file(args.fir)
         if args.module:
             return lower_circuit(circuit, args.module, note=_note,
-                                 orphan_width_fallback=args.orphan_fallback,
+                                 orphan_width_fallback=(False if args.strict_widths else None),
                                  stub_oversized_mems=args.stub_oversized_mems,
                                  mem_reg_bank_cap=args.mem_reg_bank_cap)
         top = args.top or circuit.name
         if top not in circuit.modules:
             raise _TopNotFound(top)
         return lower_circuit(circuit, top, note=_note,
-                             orphan_width_fallback=args.orphan_fallback,
+                             orphan_width_fallback=(False if args.strict_widths else None),
                              stub_oversized_mems=args.stub_oversized_mems,
                              mem_reg_bank_cap=args.mem_reg_bank_cap)
 
@@ -111,8 +111,8 @@ def main(argv=None) -> int:
     p.add_argument("-o", "--out", required=True, help="output .mlir path")
     p.add_argument("--top", help="top module name (default: circuit name)")
     p.add_argument("--module", help="lower a single module standalone")
-    p.add_argument("--orphan-fallback", action="store_true",
-                   help="default unresolved bare-UInt widths to 1 (unsound)")
+    p.add_argument("--strict-widths", action="store_true",
+                   help="error on unresolved widths instead of defaulting to 1")
     p.add_argument("--stub-oversized-mems", action="store_true",
                    help="stub memories deeper than the bank limit (reads 0)")
     p.add_argument("--mem-reg-bank-cap", type=int, default=1024,
