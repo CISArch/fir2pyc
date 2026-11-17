@@ -2391,7 +2391,14 @@ class ModuleLower:
                 return self._leaf_value(lf)
             return self._fold_driver(lf.drivers, lf)
         if isinstance(decl, (Wire, Reg)):
-            t = self._nav(decl.type, path, root)
+            try:
+                t = self._nav(decl.type, path, root)
+            except LowerError:
+                if path and decl.type.kind == "bundle":
+                    # aggregate field mismatch (issue #49): accessed field
+                    # doesn't exist on this wire/reg's type — don't-care
+                    return self._const(0, 1), 1, False
+                raise
             if t.kind in ("bundle", "vector"):
                 return self._agg_value(root, path, t)
             lf = self.leaf(root, path, t)
@@ -2502,7 +2509,16 @@ class ModuleLower:
         self.node_busy.add(key)
         try:
             t = expr_type(node.expr, self.env)
-            lt = self._nav(t, path, node.name) if path else t
+            try:
+                lt = self._nav(t, path, node.name) if path else t
+            except LowerError:
+                if path and t.kind == "bundle":
+                    # aggregate field mismatch (issue #49): the accessed
+                    # field doesn't exist on this node's value type — treat
+                    # as don't-care (constant 0), consistent with FIRRTL
+                    # invalidate semantics
+                    return self._const(0, 1), 1, False
+                raise
             if path and node.expr.kind == "prim":
                 # structural prim (e.g. mux of bundles): pass the sub-path
                 # through to the prim resolver instead of rebasing the expr
@@ -2619,12 +2635,18 @@ class ModuleLower:
             tw = max(tw, 1)
             return self._extend(ssa, tw, False, w, signed)
         if op == "bits":
-            x, xw, _ = self._resolve_value(e.args[0], None, None)
+            x, xw, xs = self._resolve_value(e.args[0], None, None)
             hi, lo = e.consts[0], e.consts[1]
-            if hi >= xw or lo > hi:
+            if lo > hi:
                 raise LowerError(
                     f"bits(i{xw})[{hi}:{lo}] out of range: arg={e.args[0]} "
                     f"module={self.mod.name}")
+            if hi >= xw:
+                # bare-UInt width inference may produce too-narrow a result
+                # (issue #47); zero-extend the operand so the extraction can
+                # proceed — preserves non-tag logic instead of stubbing the
+                # whole module
+                x, xw, xs = self._extend(x, xw, xs, hi + 1, False)
             n = hi - lo + 1
             if lo == 0 and n == xw:
                 ssa = x
@@ -2795,6 +2817,12 @@ class ModuleLower:
             self.lines.append(f"  {ssa} = pyc.not {x} : i{xw}")
             return self._extend(ssa, xw, xs, w, signed)
         if e.args[0] is None or e.args[1] is None:
+            # FIRRTL invalidate semantics: a None (don't-care) argument in a
+            # boolean/arith expression can safely resolve to constant 0.
+            # This occurs when a `when` condition references a signal that
+            # was `invalidate`d earlier in the module (issue #48).
+            if e.op in ("and", "or", "eq", "neq", "lt", "leq", "gt", "geq"):
+                return self._const(0, 1), 1, False
             raise LowerError(f"prim {e.op} None arg: " + str(e)[:80])
         ta, tb = expr_type(e.args[0], self.env), expr_type(e.args[1], self.env)
         if op == "not":
