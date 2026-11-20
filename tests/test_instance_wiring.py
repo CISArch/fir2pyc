@@ -240,3 +240,41 @@ def test_forward_reference_through_vector_index(tmp_path):
     wire_ssa = wires[0].split("=")[0].strip()
     assert wire_ssa in consumer[0], consumer[0]
     assert f"pyc.assign {wire_ssa}" in body, body
+
+
+UNRESET_FIR = """
+circuit T :
+  module T :
+    input clock : Clock
+    input reset : UInt<1>
+    input d : UInt<8>
+    output q : UInt<8>
+    reg r : UInt<8>, clock with :
+      reset => (UInt<1>("h0"), r)
+    r <= d
+    q <= r
+"""
+
+
+def test_never_reset_reg_tracks_next_during_reset(tmp_path):
+    """`reset => (UInt<1>("h0"), x)` marks a register the RTL never resets.
+
+    Approximating it with the primary reset freezes the register at a constant
+    for the whole reset window.  Designs rely on those registers being seeded
+    *during* reset -- Rocket's Frontend `s1_pc` is unreset on purpose so the
+    fetch loop picks up `s2_pc` (the reset vector) before reset is released.
+    Freezing it made s1_pc 0, which overwrote s2_pc with 0 on the first cycle
+    after reset and left the core fetching from address 0.
+
+    `init` must therefore be the register's own next value.
+    """
+    body = func_body(emit(tmp_path, UNRESET_FIR), "T")
+    reg = [ln for ln in body.splitlines() if "pyc.reg" in ln]
+    assert reg, body
+    m = re.search(r"pyc\.reg (\S+), (\S+), (\S+), (\S+), (\S+)", reg[0])
+    assert m, reg[0]
+    d_operand, init_operand = m.group(4), m.group(5)
+    # `d` is the wire driven from the input; init must be that same value, not
+    # a constant 0.
+    assert init_operand != "pyc::cpp::Bits<8>{}" and "constant 0" not in body, body
+    assert init_operand == d_operand or init_operand.startswith("%"), (d_operand, init_operand)

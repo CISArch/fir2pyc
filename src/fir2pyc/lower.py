@@ -1473,6 +1473,24 @@ class ModuleLower:
     def _reg_reset_init(self, r: Reg, lf: Leaf) -> tuple:
         if r.reset is None:
             return self.rst_arg, self._const(0, lf.width)
+        if r.reset.kind == "lit" and r.reset.value == 0:
+            # `reset => (UInt<1>("h0"), x)` declares a register the RTL *never*
+            # resets -- it keeps loading `next` through the whole reset window.
+            # Approximating that with the primary reset freezes the register at
+            # a constant while reset is asserted, which desynchronises designs
+            # that rely on those registers being seeded during reset.  Rocket's
+            # Frontend `s1_pc` is exactly this: it is unreset on purpose so the
+            # fetch loop seeds itself from `s2_pc` (the reset vector) during
+            # reset.  Honouring "no reset" is expressible with the existing op
+            # by using `next` as the reset value.
+            self.stats["unreset_reg"] = self.stats.get("unreset_reg", 0) + 1
+            # `init = next` reproduces "no reset": during reset the register
+            # simply keeps tracking its next value, exactly as the RTL does.
+            try:
+                ssa, _w, _sg = self._fold_driver(lf.drivers, lf, lf.path)
+                return self.rst_arg, ssa
+            except LowerError:
+                return self.rst_arg, self._const(0, lf.width)
         rs = self.reset_leaf
         if rs is None:
             self.stats["approx_reset"] += 1
