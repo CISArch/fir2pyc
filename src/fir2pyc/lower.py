@@ -457,41 +457,42 @@ class ModuleLower:
         self._infer_widths()
 
     def _collect(self, stmts, cond) -> None:
+        # FIRRTL statement order is free: a connect may legally appear before
+        # the `inst`/`wire`/`reg`/mem it names.  A leaf's direction
+        # (`is_input`) is a property of the declaration, but `leaf()` keeps
+        # the flag of whichever caller created the leaf first.  So a connect
+        # visited before its `inst` caches an instance *input* as an output,
+        # `_leaf_kind` then bails out and `_lhs_leaf_list` routes the leaf
+        # down the flipped-aggregate ("rev") path, where an Inst-rooted RHS
+        # is discarded as undrivable -- the consuming input silently keeps
+        # the constant-0 default.  Rocket's TestHarness hits this: its
+        # `ldut.mem_axi4.*.ready/valid` connects precede `inst ldut`, so the
+        # AXI4 responses were tied to 0 and SimAXIMem's outputs dangled.
+        # Register declarations first so directions are authoritative.
         for s in stmts:
             if isinstance(s, Wire):
                 self.leaves_of_decl(s.name, s.type)
             elif isinstance(s, Reg):
                 self.reg_info[s.name] = s
                 self.leaves_of_decl(s.name, s.type)
-            elif isinstance(s, Node):
-                pass
             elif isinstance(s, Inst):
-                sub = self.circuit.modules[s.module]
-                ins, outs = [], []
-                for p in sub.ports:
-                    base_in = p.direction == "input"
-                    for path, t, flipped in p.type.leaves():
-                        if t.kind in ("uint", "sint") and t.width == 0:
-                            continue
-                        # embed the port name: scalar ports (clock/reset)
-                        # would otherwise collide on the empty field path
-                        lf = self.leaf(s.name, f".{p.name}" + path, t,
-                                       is_input=(base_in != flipped))
-                        (ins if lf.is_input else outs).append(lf)
-                self.inst_info[s.name] = {"inst": s, "module": sub,
-                                          "in": ins, "out": outs,
-                                          "symbol": self.child_symbol(sub)}
+                self._collect_inst(s)
             elif isinstance(s, MemDecl):
                 self._collect_mem(s)
             elif isinstance(s, MemPort):
                 self.memport_info[s.name] = {"decl": s, "cond": cond,
                                              "writes": [], "has_write": False}
+        for s in stmts:
+            if isinstance(s, (Wire, Reg, Inst, MemDecl, MemPort)):
+                continue
+            elif isinstance(s, Node):
+                pass
             elif isinstance(s, Connect):
                 self._collect_connect(s, cond)
             elif isinstance(s, Invalidate):
                 for kind, lf, extra, _sfx in self._lhs_leaf_list(s.expr,
                                                                 True):
-                    if lf.is_input or kind == "memport":
+                    if lf.is_input or kind == "rev" or kind == "memport":
                         continue  # invalidate on an input / write port: no-op
                     if extra is None:
                         c = cond
@@ -513,6 +514,23 @@ class ModuleLower:
                 pass
             else:
                 raise LowerError(f"collect: unsupported stmt {type(s).__name__}")
+
+    def _collect_inst(self, s: Inst) -> None:
+        sub = self.circuit.modules[s.module]
+        ins, outs = [], []
+        for p in sub.ports:
+            base_in = p.direction == "input"
+            for path, t, flipped in p.type.leaves():
+                if t.kind in ("uint", "sint") and t.width == 0:
+                    continue
+                # embed the port name: scalar ports (clock/reset)
+                # would otherwise collide on the empty field path
+                lf = self.leaf(s.name, f".{p.name}" + path, t,
+                               is_input=(base_in != flipped))
+                (ins if lf.is_input else outs).append(lf)
+        self.inst_info[s.name] = {"inst": s, "module": sub,
+                                  "in": ins, "out": outs,
+                                  "symbol": self.child_symbol(sub)}
 
     def sync_leaf_widths_from_types(self) -> None:
         """Final pass: re-read each leaf's width from its nav'd type, so
@@ -985,9 +1003,21 @@ class ModuleLower:
                 rt = self._nav(self._decl_type(rdecl, rroot), rfull, rroot)
                 if rt.kind in ("bundle", "vector"):
                     continue  # deeper mixed aggregate: handled per leaf
-                if isinstance(rdecl, (Port, Inst)):
-                    continue  # reverse side also undrivable: no-op
                 rlf = self.leaf(rroot, rfull, rt)
+                # A flipped member transfers in the opposite direction: the
+                # LHS leaf is the source and the mirrored RHS leaf is the sink.
+                # This used to skip every Port/Inst-rooted RHS outright
+                # ("reverse side also undrivable"), silently dropping the
+                # response half of bulk connects -- Rocket's BootROM `d`
+                # channel never reached its consumers, so the core fetched
+                # zeros.  Ask `_leaf_kind` whether the RHS leaf is drivable
+                # instead of guessing: `is_input` means "sink" for an Inst but
+                # "module input, not drivable" for a Port, and `_leaf_kind` is
+                # the single place that encodes that asymmetry.
+                try:
+                    self._leaf_kind(rdecl, rlf)
+                except LowerError:
+                    continue  # RHS member is not a legal sink
                 rlf.drivers.append(
                     (c, self._rebase(Expr(kind="ref", name=lf.root), lf.path), ""))
                 continue
@@ -1033,9 +1063,17 @@ class ModuleLower:
                 if t.kind in ("uint", "sint") and t.width == 0:
                     continue
                 if isinstance(decl, Wire) and f and path != suffix:
-                    # wire-rooted bulk connect: a flipped sub-leaf is
-                    # reverse-flow; forward-driving it fabricates
-                    # combinational cycles (matches evalfir's rule)
+                    # Wire-rooted bulk connect: a flipped sub-leaf is
+                    # reverse-flow -- forward-driving it fabricates
+                    # combinational cycles.  It is also the *sink* of the
+                    # mirrored leaf on the RHS, so hand it to the reverse
+                    # transfer instead of dropping it: Rocket's
+                    # `in <= auto.in` is how BootROM drives its `d` channel
+                    # back to the module port, and dropping it left the
+                    # whole ROM lookup dangling behind a constant 0.
+                    if not for_invalidate:
+                        out.append(("rev", self.leaf(rootname, path, t),
+                                    None, suffix))
                     continue
                 lf = self.leaf(rootname, path, t)
                 try:
@@ -1435,6 +1473,24 @@ class ModuleLower:
     def _reg_reset_init(self, r: Reg, lf: Leaf) -> tuple:
         if r.reset is None:
             return self.rst_arg, self._const(0, lf.width)
+        if r.reset.kind == "lit" and r.reset.value == 0:
+            # `reset => (UInt<1>("h0"), x)` declares a register the RTL *never*
+            # resets -- it keeps loading `next` through the whole reset window.
+            # Approximating that with the primary reset freezes the register at
+            # a constant while reset is asserted, which desynchronises designs
+            # that rely on those registers being seeded during reset.  Rocket's
+            # Frontend `s1_pc` is exactly this: it is unreset on purpose so the
+            # fetch loop seeds itself from `s2_pc` (the reset vector) during
+            # reset.  Honouring "no reset" is expressible with the existing op
+            # by using `next` as the reset value.
+            self.stats["unreset_reg"] = self.stats.get("unreset_reg", 0) + 1
+            # `init = next` reproduces "no reset": during reset the register
+            # simply keeps tracking its next value, exactly as the RTL does.
+            try:
+                ssa, _w, _sg = self._fold_driver(lf.drivers, lf, lf.path)
+                return self.rst_arg, ssa
+            except LowerError:
+                return self.rst_arg, self._const(0, lf.width)
         rs = self.reset_leaf
         if rs is None:
             self.stats["approx_reset"] += 1
@@ -1587,13 +1643,20 @@ class ModuleLower:
         cur = e
         while cur is not None and cur.kind in ("subfield", "subindex"):
             if cur.kind == "subfield":
-                parts.insert(0, cur.name)
+                parts.insert(0, "." + cur.name)
             elif cur.kind == "subindex":
-                parts.insert(0, str(cur.index))
+                # `idx` holds a static subindex; `index` is the dynamic
+                # subaccess operand (an Expr) -- reading the latter here made
+                # every vector-indexed source path spell out `[None]`, so the
+                # wire-breaking pre-scan never matched a source leaf.  Any
+                # forward reference through a vector port (Rocket's PTW
+                # `io.requestor[1]`, the tile's TL channel vectors) then
+                # silently degraded to a constant 0.
+                parts.insert(0, f"[{cur.idx}]")
             cur = cur.base
         if cur is None or cur.kind != "ref":
             return None
-        return "." + ".".join(parts) if parts else "."
+        return "".join(parts) if parts else "."
 
     def _emit_instances_single_pass(self) -> None:
         """Single-pass instance emission with wire-breaking for backward
@@ -1633,7 +1696,18 @@ class ModuleLower:
                         # e.g., driver "mem.io_axi4.0.aw.ready" → src_path ".io_axi4.0.aw.ready"
                         drv_path = self._expr_to_path(v)
                         if drv_path is not None:
-                            src_path = drv_path
+                            # `v` may name a *bundle* port (`x.auto.tl_out`) whose
+                            # value is the whole aggregate; the source instance
+                            # only holds per-leaf results, so the consuming
+                            # leaf's residual path (`_r`, recorded by
+                            # `_add_driver`) completes it.  Without this the
+                            # match below never fires for bundle-valued bulk
+                            # connects -- e.g. Rocket's tile→sbus TL port had
+                            # all of its `a` channel tied to 0, so the core
+                            # never issued a request and never booted.
+                            src_path = drv_path + _r
+                        else:
+                            src_path = None
                         if src_path is not None:
                             # Find matching output leaf on source instance
                             for src_lf in src_info["out"]:
@@ -1675,6 +1749,17 @@ class ModuleLower:
                             wssa, src_w, src_sg, lf.width, lf.signed())
                         argvals.append(ext_ssa)
                     else:
+                        if not lf.drivers:
+                            # No connect ever reached this instance input, so
+                            # the edge is silently tied to 0 below.  Surface it:
+                            # an undriven instance input means a FIRRTL connect
+                            # was dropped, which turns real hardware into a
+                            # constant and is otherwise invisible.
+                            self.stats["undriven_inst_input"] = \
+                                self.stats.get("undriven_inst_input", 0) + 1
+                            self.note("undriven_inst_input",
+                                      f"{self.mod.name}.{iname}{lf.path} "
+                                      f"({lf.width}b)")
                         ssa, w, sg = self._fold_driver(lf.drivers, lf, lf.path)
                         ssa, w, _s2 = self._extend(ssa, w, sg, lf.width, lf.signed())
                         argvals.append(ssa)
