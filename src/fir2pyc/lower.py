@@ -765,6 +765,29 @@ class ModuleLower:
                 t = self.env.types.get(nn)
                 print('  type', nn, '=', t.width if t is not None and t.kind in ('uint','sint') else (t.kind if t else None))
 
+        # Snapshot LEAF PATHS whose widths are explicitly declared BEFORE
+        # the consumer-lower-bound patch below.  Only these stay exempt
+        # from the driver-max pass later: a width-less wire/reg leaf
+        # (scalar, or a bare element of an aggregate such as
+        # `reg ex_reg_rs_msb : UInt[2]`) whose type was merely LB-patched
+        # (e.g. `wire id_rs_0` referenced as bits(id_rs_0,1,0)) must still
+        # take max(LB, driver widths) per FIRRTL InferWidths semantics —
+        # LB alone under-sizes the decl and every consumer that reads the
+        # full value gets a truncated/zext'd shadow.
+        explicit_paths = set()
+        for _n, _d in self.env.decls.items():
+            if not isinstance(_d, (Wire, Reg)) and not (
+                    isinstance(_d, Port) and _d.direction == "output"):
+                continue
+            _t = getattr(_d, "type", None)
+            if _t is None or _t.kind not in ("uint", "sint",
+                                             "bundle", "vector"):
+                continue
+            for _p, _lt, _fl in _t.leaves():
+                if _lt.kind in ("uint", "sint") \
+                        and _lt.width is not None and _lt.width >= 0:
+                    explicit_paths.add((_n, _p))
+
         for key, w in LB.items():
             root, path = key
             try:
@@ -785,42 +808,92 @@ class ModuleLower:
                 lf.width = t.width
                 lf.is_zw = False
 
+        # Driver typing must reach a FIXED POINT: expr_type on a driver can
+        # reference another width-less decl (e.g. a bare-element reg
+        # driven by `shr(id_rs_0, 2)` while `wire id_rs_0` is itself
+        # width-less).  Aggregate decls (vector/bundle) are handled PER
+        # LEAF PATH: a decl-level `t.kind in (uint, sint)` guard skips
+        # them entirely, freezing bare elements at their consumer-LB seed
+        # (observed: ex_reg_rs_msb stuck at 32 instead of 62).  Widths
+        # only ever grow, so iterate until stable.
+        _drv_scope = []
         for name, decl in self.env.decls.items():
             is_out_port = isinstance(decl, Port) and decl.direction == "output"
             if not isinstance(decl, (Wire, Reg)) and not is_out_port:
                 continue
-            t = decl.type
-            if t.kind not in ("uint", "sint") or t.width >= 0:
-                continue  # width known
-            w = None
-            for key, lf in self.leaves.items():
-                if lf.root != name:
+            dt = decl.type
+            if dt.kind not in ("uint", "sint", "bundle", "vector"):
+                continue  # clockish/probe decls not width-inferred here
+            _drv_scope.append((name, decl, dt.leaves()))
+        # Node types are SNAPSHOTS taken at Env build time, when bare decls
+        # still had width -1: a node like `shr(id_rs_0, 2)` cached width
+        # max(-1-2, 1) = 1 and never re-grew after id_rs_0 was inferred to
+        # 64, so driver typing through node refs saw stale widths.  Re-
+        # evaluate node types every round (declaration order == dependency
+        # order in FIRRTL) so drivers observe true widths.
+        _node_scope = [(n, d) for n, d in self.env.decls.items()
+                       if isinstance(d, Node)]
+        for _fp in range(6):
+            _fp_changed = False
+            for _n, _d in _node_scope:
+                try:
+                    _nt = expr_type(_d.expr, self.env)
+                except LowerError:
                     continue
-                # FIRRTL InferWidths: a REG must also hold its reset INIT
-                # value -> the init literal width is a width lower bound
-                if isinstance(decl, Reg) and getattr(decl, "init", None) is not None:
-                    try:
-                        it = expr_type(decl.init, self.env)
-                    except LowerError:
-                        it = None
-                    if it is not None and it.kind in ("uint", "sint") \
-                            and it.width and it.width > 0:
-                        w = it.width if w is None else max(w, it.width)
-                for _c, v, _r in lf.drivers:
-                    if v is None:
+                _ot = self.env.types.get(_n)
+                if _ot is _nt:
+                    continue
+                if _ot is not None and _nt is not None \
+                        and _ot.kind == _nt.kind and _ot.kind in ("uint", "sint") \
+                        and _ot.width == _nt.width:
+                    continue  # unchanged: keep original snapshot object
+                self.env.types[_n] = _nt
+                _fp_changed = True
+            for name, decl, _lv in _drv_scope:
+                for path, lt, _fl in _lv:
+                    if lt.kind not in ("uint", "sint"):
                         continue
-                    try:
-                        tv = expr_type(v, self.env)
-                    except LowerError:
-                        continue
-                    # FIRRTL InferWidths: the wire must hold ANY driver's
-                    # value -> take the MAX driver width, not the first
-                    if tv.kind in ("uint", "sint") and tv.width and \
-                            tv.width > 0:
-                        w = tv.width if w is None else max(w, tv.width)
-            if w is None:
-                w = 1
-            t.width = w
+                    if (name, path) in explicit_paths:
+                        continue  # explicitly-declared width is authoritative
+                    # Seed with the consumer-LB width (possibly patched
+                    # above), then grow to the max over drivers / reg-init
+                    # so the leaf can hold ANY driver value
+                    # (InferWidths = constraint max).
+                    w = lt.width if (lt.width is not None
+                                     and lt.width > 0) else None
+                    # FIRRTL InferWidths: a REG must also hold its reset
+                    # INIT value -> the init literal width is a lower bound
+                    if isinstance(decl, Reg) and path == "" \
+                            and getattr(decl, "init", None) is not None:
+                        try:
+                            it = expr_type(decl.init, self.env)
+                        except LowerError:
+                            it = None
+                        if it is not None and it.kind in ("uint", "sint") \
+                                and it.width and it.width > 0:
+                            w = it.width if w is None else max(w, it.width)
+                    lf = self.leaves.get(name + path)
+                    if lf is not None:
+                        for _c, v, _r in lf.drivers:
+                            if v is None:
+                                continue
+                            try:
+                                tv = expr_type(v, self.env)
+                            except LowerError:
+                                continue
+                            # FIRRTL InferWidths: the leaf must hold ANY
+                            # driver's value -> take the MAX driver width,
+                            # not the first
+                            if tv.kind in ("uint", "sint") and tv.width and \
+                                    tv.width > 0:
+                                w = tv.width if w is None else max(w, tv.width)
+                    if w is None:
+                        w = 1
+                    if w > lt.width:
+                        lt.width = w
+                        _fp_changed = True
+            if not _fp_changed:
+                break
 
         # sync inferred widths into every leaf (ports included)
         for lf in self.leaves.values():
@@ -975,9 +1048,20 @@ class ModuleLower:
                 rt = self._nav(self._decl_type(rdecl, rroot), rfull, rroot)
                 if rt.kind in ("bundle", "vector"):
                     continue  # deeper mixed aggregate: handled per leaf
-                if isinstance(rdecl, (Port, Inst)):
-                    continue  # reverse side also undrivable: no-op
                 rlf = self.leaf(rroot, rfull, rt)
+                if isinstance(rdecl, (Port, Inst)):
+                    # Reverse transfer is legal iff the RHS leaf is drivable
+                    # from this module: an *output* port field or an *input*
+                    # field of the instance.  Module inputs and instance
+                    # outputs are driven from outside -> no-op.  (Skipping
+                    # unconditionally dropped connections like
+                    # `connect ibuf.io.imem, io.imem.resp`, whose reverse
+                    # field io.imem.resp.ready <- ibuf.io.imem.ready left the
+                    # module output tied to constant 0.)
+                    try:
+                        self._leaf_kind(rdecl, rlf)
+                    except LowerError:
+                        continue
                 rlf.drivers.append(
                     (c, self._rebase(Expr(kind="ref", name=lf.root), lf.path), ""))
                 continue
@@ -1461,6 +1545,17 @@ class ModuleLower:
 
     # ---- instances ----------------
     def _emit_instances(self) -> None:
+        # Two-phase emission.  Resolving an instance input's driver eagerly
+        # can pull arbitrary combinational logic, including reads of OTHER
+        # instances' output fields.  With instances emitted strictly in
+        # declaration order those reads miss inst_out_ssa, fall back to the
+        # orphan constant 0, and node_memo/val_memo cache the poisoned value
+        # (observed on Rocket: rf read addresses bits(id_raddr1..3, 4, 0)
+        # folded to constant 0 and every register-file access went dead).
+        # Phase 1 therefore emits every instance op with placeholder wires
+        # as data inputs; phase 2 resolves the real drivers only after all
+        # instance results exist and binds them with pyc.assign.
+        pending_args = []
         for iname, info in self.inst_info.items():
             ins, outs = info["in"], info["out"]
             if info["module"].ext:
@@ -1497,8 +1592,11 @@ class ModuleLower:
                 if lf.is_clockish:
                     argvals.append(self._clockish_value(lf))
                 else:
-                    ssa, _w, _s = self._fold_driver(lf.drivers, lf)
-                    argvals.append(ssa)
+                    wssa = self.tmp()
+                    self.lines.append(
+                        f"  {wssa} = pyc.wire : {lf.pyctype()}")
+                    pending_args.append((wssa, lf))
+                    argvals.append(wssa)
             # callee signature carries pyc_clk/pyc_rst tie-offs; pass the
             # parent's primary clock (or its own tie-off) + tie-off reset
             pclk = (self._arg_ssa(self.clock_leaf) if self.clock_leaf is not None
@@ -1524,10 +1622,45 @@ class ModuleLower:
             else:
                 self.lines.append(
                     f"  pyc.instance {args} {callee} : ({tys_in}) -> ()")
+        # Phase 2: all instance results exist, so driver resolution can no
+        # longer miss another instance's outputs.
+        for wssa, lf in pending_args:
+            ssa, _w, _s = self._fold_driver(lf.drivers, lf)
+            self.lines.append(f"  pyc.assign {wssa}, {ssa} : {lf.pyctype()}")
+
+    # Identifiers that clash with Verilog-2001/2005 keywords: pycc passes
+    # pyc.instance names straight into the emitted Verilog as instance
+    # names, so e.g. FIRRTL's `inst reg of AsyncResetRegVec` would produce
+    # the illegal `reg reg (...)`.
+    _VERILOG_KEYWORDS = frozenset({
+        "always", "and", "assign", "automatic", "begin", "buf", "bufif0",
+        "bufif1", "case", "casex", "casez", "cell", "cmos", "config",
+        "deassign", "default", "defparam", "design", "disable", "edge",
+        "else", "end", "endcase", "endconfig", "endfunction", "endgenerate",
+        "endmodule", "endprimitive", "endspecify", "endtable", "endtask",
+        "event", "for", "force", "forever", "fork", "function", "generate",
+        "genvar", "highz0", "highz1", "if", "ifnone", "incdir", "include",
+        "initial", "inout", "input", "instance", "integer", "join", "large",
+        "liblist", "library", "localparam", "macromodule", "medium", "module",
+        "nand", "negedge", "nmos", "nor", "noshowcancelled", "not", "notif0",
+        "notif1", "or", "output", "parameter", "pmos", "posedge", "primitive",
+        "pull0", "pull1", "pulldown", "pullup", "pulsestyle_onevent",
+        "pulsestyle_ondetect", "rcmos", "real", "realtime", "reg", "release",
+        "repeat", "rnmos", "rpmos", "rtran", "rtranif0", "rtranif1",
+        "scalared", "showcancelled", "signed", "small", "specify", "specparam",
+        "strong0", "strong1", "supply0", "supply1", "table", "task", "time",
+        "tran", "tranif0", "tranif1", "tri", "tri0", "tri1", "triand",
+        "trior", "trireg", "unsigned", "use", "vectored", "wait", "wand",
+        "weak0", "weak1", "while", "wire", "wor", "xnor", "xor",
+    })
 
     def _inst_name(self, iname: str) -> str:
         n = re.sub(r"[^A-Za-z0-9_]", "_", iname)
-        return n if re.match(r"^[A-Za-z_]", n) else "i_" + n
+        if not re.match(r"^[A-Za-z_]", n):
+            n = "i_" + n
+        if n.lower() in self._VERILOG_KEYWORDS:
+            n += "_i"
+        return n
 
     # ---- assigns ----------------
     def _wire_dep_order(self, keys) -> list:
